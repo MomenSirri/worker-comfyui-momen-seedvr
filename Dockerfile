@@ -74,10 +74,6 @@ WORKDIR /
 # Install Python runtime dependencies for the handler
 RUN uv pip install runpod requests websocket-client
 
-# Add application code and scripts
-ADD src/start.sh src/network_volume.py handler.py test_input.json ./
-RUN chmod +x /start.sh
-
 # Add script to install custom nodes
 COPY scripts/comfy-node-install.sh /usr/local/bin/comfy-node-install
 RUN chmod +x /usr/local/bin/comfy-node-install
@@ -91,6 +87,11 @@ RUN chmod +x /usr/local/bin/comfy-manager-set-mode
 
 # Set the default command to run when starting the container
 CMD ["/start.sh"]
+
+# Keep runtime files in a dedicated stage so handler edits do not bust heavy build cache.
+FROM base AS runtime-files
+ADD src/start.sh src/network_volume.py handler.py test_input.json ./
+RUN chmod +x /start.sh
 
 # Stage 2: Download models
 FROM base AS downloader
@@ -380,6 +381,9 @@ RUN --mount=type=cache,target=/opt/wheels \
  && bash /tmp/install_llama_vision.sh \
  && rm -f /tmp/install_llama_vision.sh
 
+# Add runtime worker entrypoint files as the last layer for fast handler-only rebuilds
+COPY --from=runtime-files /start.sh /network_volume.py /handler.py /test_input.json /
+CMD ["/start.sh"]
 
 
 
@@ -434,6 +438,10 @@ RUN rm -rf /comfyui/custom_nodes/was-node-suite-comfyui \
  && git fetch --depth 1 origin ${WAS_COMMIT} \
  && git checkout FETCH_HEAD \
  && if [ -f requirements.txt ]; then /opt/venv/bin/python -m pip install --no-cache-dir -r requirements.txt; fi
+
+# Add runtime worker entrypoint files as the last layer for fast handler-only rebuilds
+COPY --from=runtime-files /start.sh /network_volume.py /handler.py /test_input.json /
+CMD ["/start.sh"]
 
 
 
@@ -618,3 +626,7 @@ RUN --mount=type=cache,target=/opt/wheels \
  && mv /tmp/install_llama_vision.lf /tmp/install_llama_vision.sh \
  && bash /tmp/install_llama_vision.sh \
  && rm -f /tmp/install_llama_vision.sh
+
+# Add runtime worker entrypoint files as the last layer for fast handler-only rebuilds
+COPY --from=runtime-files /start.sh /network_volume.py /handler.py /test_input.json /
+CMD ["/start.sh"]
