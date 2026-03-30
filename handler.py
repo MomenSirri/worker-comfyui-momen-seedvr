@@ -102,6 +102,11 @@ REFRESH_WORKER = os.environ.get("REFRESH_WORKER", "false").lower() == "true"
 REFRESH_WORKER_ON_FAILURE = (
     os.environ.get("REFRESH_WORKER_ON_FAILURE", "true").lower() == "true"
 )
+# Fail fast on Comfy execution errors to avoid extra post-error progress updates
+# that can keep RunPod request status in IN_PROGRESS longer than necessary.
+FAIL_FAST_ON_EXECUTION_ERROR = (
+    os.environ.get("FAIL_FAST_ON_EXECUTION_ERROR", "true").lower() == "true"
+)
 
 
 def _failure_result(error_message, details=None):
@@ -273,13 +278,50 @@ def _effective_enhancement_node(runtime_log_state):
     )
 
 
+def _ensure_enhance_node_state(runtime_log_state, node_key):
+    if node_key is None:
+        return None
+    key = str(node_key)
+    nodes = runtime_log_state.setdefault("enhance_nodes", {})
+    if key not in nodes:
+        nodes[key] = {
+            "samples_done": 0,
+            "counted_current": False,
+            "cycle_complete": False,
+            "peak_step": 0,
+            "last_step": None,
+            "last_total_steps": None,
+            "last_total_emitted": None,
+            "executed_seen": False,
+            "phase_initialized": False,
+            "node_type": None,
+            "node_title": None,
+            "selected_from_progress": False,
+            "total_hint": None,
+        }
+    return nodes[key]
+
+
+def _enhance_tracked_nodes(runtime_log_state):
+    nodes = runtime_log_state.get("enhance_nodes", {})
+    if nodes:
+        return list(nodes.keys())
+    active = _effective_enhancement_node(runtime_log_state)
+    if active:
+        return [str(active)]
+    return []
+
+
 def _is_active_enhancement_node(runtime_log_state, node_id):
     if not node_id:
         return False
     target = _effective_enhancement_node(runtime_log_state)
-    if not target:
-        return False
-    return str(node_id) == str(target)
+    if target:
+        return str(node_id) == str(target)
+    hint = runtime_log_state.get("enhance_node_hint")
+    if hint:
+        return str(node_id) == str(hint)
+    return str(node_id) in runtime_log_state.get("enhance_nodes", {})
 
 
 def _select_enhancement_node(
@@ -292,66 +334,73 @@ def _select_enhancement_node(
     source="generic",
 ):
     selected = runtime_log_state.get("enhance_node_selected")
-    if selected:
-        if str(selected) == str(node_key):
-            if source == "progress":
-                runtime_log_state["enhance_selected_from_progress"] = True
-            return True
-
-        # Prefer nodes that emit sampler progress as the authoritative
-        # enhancement node. This avoids latching onto helper sampler nodes.
-        if (
-            source == "progress"
-            and not runtime_log_state.get("enhance_selected_from_progress", False)
-        ):
-            runtime_log_state["enhance_counted_current"] = False
-            runtime_log_state["enhance_cycle_complete"] = False
-            runtime_log_state["enhance_peak_step"] = 0
-            runtime_log_state["enhance_last_step"] = None
-            runtime_log_state["enhance_last_total_steps"] = None
-        else:
-            return False
-
     hint = runtime_log_state.get("enhance_node_hint")
     if hint and str(hint) != str(node_key):
         return False
 
-    runtime_log_state["enhance_node_selected"] = str(node_key)
+    node_key = str(node_key)
+    node_state = _ensure_enhance_node_state(runtime_log_state, node_key)
+    node_state["node_title"] = node_title
+    node_state["node_type"] = node_type
+    node_state["selected_from_progress"] = source == "progress"
+
+    runtime_log_state["enhance_node_selected"] = node_key
     runtime_log_state["enhance_node_title"] = node_title
     runtime_log_state["enhance_node_type"] = node_type
     runtime_log_state["enhance_selected_from_progress"] = source == "progress"
-    _emit_live_log(
-        job,
-        progress_state,
-        "enhance-node",
-        f"selected node={node_key} type={node_type} source={source}",
-        force=True,
-    )
+
+    if str(selected) != node_key:
+        _emit_live_log(
+            job,
+            progress_state,
+            "enhance-node",
+            f"selected node={node_key} type={node_type} source={source}",
+            force=True,
+        )
     return True
 
 
-def _enhance_total_hint(runtime_log_state):
+def _enhance_total_hint(runtime_log_state, node_key=None):
+    if node_key is not None:
+        node_state = _ensure_enhance_node_state(runtime_log_state, node_key)
+        node_total = node_state.get("total_hint")
+        if isinstance(node_total, int) and node_total > 0:
+            return node_total
+
     total = runtime_log_state.get("last_frames_total")
     if isinstance(total, int) and total > 0:
         return total
     return None
 
 
-def _enhance_state_values(runtime_log_state):
+def _enhance_state_values(runtime_log_state, node_key=None):
     node_key = (
-        _effective_enhancement_node(runtime_log_state)
-        or runtime_log_state.get("active_node_id")
-        or "unknown"
+        str(node_key)
+        if node_key is not None
+        else (
+            _effective_enhancement_node(runtime_log_state)
+            or runtime_log_state.get("active_node_id")
+            or "unknown"
+        )
     )
-    done = int(runtime_log_state.get("enhance_samples_done") or 0)
-    total_hint = _enhance_total_hint(runtime_log_state)
+    node_state = _ensure_enhance_node_state(runtime_log_state, node_key)
+    done = int(node_state.get("samples_done") or 0)
+    total_hint = _enhance_total_hint(runtime_log_state, node_key=node_key)
     if total_hint:
         done = min(done, total_hint)
     return str(node_key), done, total_hint
 
 
-def _emit_enhance_state(job, progress_state, runtime_log_state, force=False):
-    node_key, done, total_hint = _enhance_state_values(runtime_log_state)
+def _emit_enhance_state(
+    job,
+    progress_state,
+    runtime_log_state,
+    force=False,
+    node_key=None,
+):
+    node_key, done, total_hint = _enhance_state_values(
+        runtime_log_state, node_key=node_key
+    )
     if total_hint:
         message = f"node={node_key} done={done} total={total_hint}"
     else:
@@ -360,27 +409,100 @@ def _emit_enhance_state(job, progress_state, runtime_log_state, force=False):
 
 
 def _maybe_enhance_state_suffix(runtime_log_state):
-    if not runtime_log_state.get("enhance_phase_initialized", False):
+    nodes = _enhance_tracked_nodes(runtime_log_state)
+    if not nodes:
         return ""
-    _, done, total_hint = _enhance_state_values(runtime_log_state)
-    if total_hint:
-        return f" [enhance_done={done}/{total_hint}]"
-    if done > 0:
-        return f" [enhance_done={done}]"
-    return ""
+
+    parts = []
+    per_node = {}
+    for node_key in sorted(nodes):
+        _, done, total_hint = _enhance_state_values(runtime_log_state, node_key=node_key)
+        if done <= 0 and not total_hint:
+            continue
+        if total_hint:
+            parts.append(f"{node_key}:{done}/{total_hint}")
+            per_node[node_key] = (done, total_hint)
+        else:
+            parts.append(f"{node_key}:{done}")
+            per_node[node_key] = (done, None)
+
+    if not parts:
+        return ""
+
+    primary_node = _effective_enhancement_node(runtime_log_state)
+    if primary_node not in per_node:
+        primary_node = sorted(per_node.keys())[0]
+
+    primary_done, primary_total = per_node[primary_node]
+    if isinstance(primary_total, int) and primary_total > 0:
+        base = f" [enhance_done={primary_done}/{primary_total}]"
+    else:
+        base = f" [enhance_done={primary_done}]"
+
+    if len(parts) == 1:
+        return base
+
+    return f"{base} [enhance_nodes={' | '.join(parts)}]"
 
 
-def _emit_enhance_item(job, progress_state, runtime_log_state, reason):
-    total_hint = _enhance_total_hint(runtime_log_state)
-    runtime_log_state["enhance_samples_done"] += 1
-    if total_hint:
-        runtime_log_state["enhance_samples_done"] = min(
-            runtime_log_state["enhance_samples_done"],
-            total_hint,
+def _emit_all_enhance_states(job, progress_state, runtime_log_state, force=False):
+    nodes = _enhance_tracked_nodes(runtime_log_state)
+    if not nodes:
+        return
+    for node_key in sorted(nodes):
+        _emit_enhance_state(
+            job,
+            progress_state,
+            runtime_log_state,
+            force=force,
+            node_key=node_key,
         )
 
-    done = runtime_log_state["enhance_samples_done"]
-    node_key = _effective_enhancement_node(runtime_log_state) or "unknown"
+
+def _emit_enhance_completion_for_all(job, progress_state, runtime_log_state, reason):
+    nodes = _enhance_tracked_nodes(runtime_log_state)
+    for node_key in nodes:
+        _emit_enhance_completion_if_needed(
+            job,
+            progress_state,
+            runtime_log_state,
+            reason=reason,
+            node_key=node_key,
+        )
+
+
+def _sync_active_enhance_compat(runtime_log_state, node_key):
+    node_state = _ensure_enhance_node_state(runtime_log_state, node_key)
+    runtime_log_state["enhance_samples_done"] = int(node_state.get("samples_done") or 0)
+    runtime_log_state["enhance_counted_current"] = bool(node_state.get("counted_current"))
+    runtime_log_state["enhance_cycle_complete"] = bool(node_state.get("cycle_complete"))
+    runtime_log_state["enhance_peak_step"] = int(node_state.get("peak_step") or 0)
+    runtime_log_state["enhance_last_step"] = node_state.get("last_step")
+    runtime_log_state["enhance_last_total_steps"] = node_state.get("last_total_steps")
+    runtime_log_state["enhance_phase_initialized"] = bool(node_state.get("phase_initialized"))
+    runtime_log_state["enhance_executed_seen"] = bool(node_state.get("executed_seen"))
+
+
+def _emit_enhance_item(job, progress_state, runtime_log_state, reason, node_key=None):
+    node_key = (
+        str(node_key)
+        if node_key is not None
+        else (
+            _effective_enhancement_node(runtime_log_state)
+            or runtime_log_state.get("active_node_id")
+            or "unknown"
+        )
+    )
+    node_state = _ensure_enhance_node_state(runtime_log_state, node_key)
+    if not node_state.get("phase_initialized", False):
+        node_state["phase_initialized"] = True
+
+    total_hint = _enhance_total_hint(runtime_log_state, node_key=node_key)
+    node_state["samples_done"] = int(node_state.get("samples_done") or 0) + 1
+    if total_hint:
+        node_state["samples_done"] = min(node_state["samples_done"], total_hint)
+
+    done = node_state["samples_done"]
 
     if total_hint:
         _emit_live_log(
@@ -413,36 +535,46 @@ def _emit_enhance_item(job, progress_state, runtime_log_state, reason):
             force=True,
         )
 
-    runtime_log_state["enhance_counted_current"] = True
-    runtime_log_state["enhance_cycle_complete"] = True
-    _emit_enhance_state(job, progress_state, runtime_log_state, force=True)
+    node_state["counted_current"] = True
+    node_state["cycle_complete"] = True
+    _sync_active_enhance_compat(runtime_log_state, node_key)
+    _emit_enhance_state(
+        job, progress_state, runtime_log_state, force=True, node_key=node_key
+    )
     print(
         f"worker-comfyui - Enhancement item counted ({reason}): node={node_key} done={done}"
     )
 
 
-def _emit_enhance_completion_if_needed(job, progress_state, runtime_log_state, reason):
-    if not runtime_log_state.get("enhance_phase_initialized", False):
-        return
-
-    node_key = _effective_enhancement_node(runtime_log_state)
+def _emit_enhance_completion_if_needed(
+    job, progress_state, runtime_log_state, reason, node_key=None
+):
+    node_key = (
+        str(node_key)
+        if node_key is not None
+        else _effective_enhancement_node(runtime_log_state)
+    )
     if not node_key:
         return
 
-    total_hint = _enhance_total_hint(runtime_log_state)
+    node_state = _ensure_enhance_node_state(runtime_log_state, node_key)
+    if not node_state.get("phase_initialized", False):
+        return
+
+    total_hint = _enhance_total_hint(runtime_log_state, node_key=node_key)
     if not isinstance(total_hint, int) or total_hint <= 0:
         return
 
-    done = int(runtime_log_state.get("enhance_samples_done") or 0)
+    done = int(node_state.get("samples_done") or 0)
     if done >= total_hint:
         return
 
-    runtime_log_state["enhance_samples_done"] = total_hint
-    runtime_log_state["enhance_counted_current"] = True
-    runtime_log_state["enhance_cycle_complete"] = True
-    runtime_log_state["enhance_peak_step"] = 0
-    runtime_log_state["enhance_last_step"] = None
-    runtime_log_state["enhance_last_total_steps"] = None
+    node_state["samples_done"] = total_hint
+    node_state["counted_current"] = True
+    node_state["cycle_complete"] = True
+    node_state["peak_step"] = 0
+    node_state["last_step"] = None
+    node_state["last_total_steps"] = None
 
     _emit_live_log(
         job,
@@ -458,24 +590,52 @@ def _emit_enhance_completion_if_needed(job, progress_state, runtime_log_state, r
         f"{total_hint}/{total_hint}",
         force=True,
     )
-    _emit_enhance_state(job, progress_state, runtime_log_state, force=True)
+    _sync_active_enhance_compat(runtime_log_state, node_key)
+    _emit_enhance_state(
+        job, progress_state, runtime_log_state, force=True, node_key=node_key
+    )
     print(
         f"worker-comfyui - Enhancement completion reconciled ({reason}): node={node_key} done={total_hint}/{total_hint}"
     )
 
 
-def _maybe_finalize_enhance_cycle(job, progress_state, runtime_log_state, reason):
-    if runtime_log_state.get("enhance_counted_current", False):
+def _maybe_finalize_enhance_cycle(
+    job, progress_state, runtime_log_state, reason, node_key=None
+):
+    node_key = (
+        str(node_key)
+        if node_key is not None
+        else _effective_enhancement_node(runtime_log_state)
+    )
+    if not node_key:
         return
 
-    total_steps = runtime_log_state.get("enhance_last_total_steps")
+    node_state = _ensure_enhance_node_state(runtime_log_state, node_key)
+    if node_state.get("counted_current", False):
+        return
+
+    total_steps = node_state.get("last_total_steps")
     if not isinstance(total_steps, int) or total_steps <= 0:
         return
 
-    peak_step = int(runtime_log_state.get("enhance_peak_step") or 0)
-    threshold = max(1, int(round(total_steps * max(0.0, min(1.0, ENHANCE_CYCLE_COMPLETE_RATIO)))))
+    peak_step = int(node_state.get("peak_step") or 0)
+    threshold = max(
+        1,
+        int(round(total_steps * max(0.0, min(1.0, ENHANCE_CYCLE_COMPLETE_RATIO)))),
+    )
     if peak_step >= threshold:
-        _emit_enhance_item(job, progress_state, runtime_log_state, reason=reason)
+        _emit_enhance_item(
+            job,
+            progress_state,
+            runtime_log_state,
+            reason=reason,
+            node_key=node_key,
+        )
+        node_state["peak_step"] = 0
+
+
+# Legacy single-node helpers removed below; multi-node logic above keeps
+# backwards-compatible messages while tracking node=3 and node=143 independently.
 
 
 def _init_runtime_log_state():
@@ -488,6 +648,7 @@ def _init_runtime_log_state():
         "last_upscale": None,
         "last_decode": None,
         "active_node_id": None,
+        "enhance_nodes": {},
         "enhance_node_hint": ENHANCEMENT_TRACK_NODE_ID,
         "enhance_node_selected": None,
         "enhance_node_type": None,
@@ -606,35 +767,38 @@ def _emit_seedvr_runtime_logs(job, progress_state, runtime_log_state):
 
         active_node_id = runtime_log_state.get("active_node_id")
         if _is_active_enhancement_node(runtime_log_state, active_node_id):
+            node_state = _ensure_enhance_node_state(runtime_log_state, active_node_id)
             total_frames = runtime_log_state.get("last_frames_total")
             if (
                 total_frames
-                and runtime_log_state.get("last_enhance_total_emitted") != total_frames
+                and node_state.get("last_total_emitted") != total_frames
             ):
-                runtime_log_state["last_enhance_total_emitted"] = total_frames
+                node_state["last_total_emitted"] = total_frames
+                node_state["total_hint"] = total_frames
                 _emit_live_log(
                     job,
                     progress_state,
                     "enhance-frames",
-                    f"total={total_frames}",
+                    f"node={active_node_id} total={total_frames}",
                     force=True,
                 )
 
             if EULER_START_PATTERN.search(line) or TQDM_START_PATTERN.search(line):
-                runtime_log_state["enhance_counted_current"] = False
-                runtime_log_state["enhance_cycle_complete"] = False
-                runtime_log_state["enhance_peak_step"] = 0
+                node_state["counted_current"] = False
+                node_state["cycle_complete"] = False
+                node_state["peak_step"] = 0
             elif EULER_DONE_PATTERN.search(line) or TQDM_DONE_PATTERN.search(line):
                 # Fallback-only mode: if websocket 'executed' events are visible, they are
                 # a more stable source for per-image enhancement counting.
-                if runtime_log_state.get("enhance_executed_seen", False):
+                if node_state.get("executed_seen", False):
                     continue
-                if not runtime_log_state.get("enhance_counted_current", False):
+                if not node_state.get("counted_current", False):
                     _emit_enhance_item(
                         job,
                         progress_state,
                         runtime_log_state,
                         reason="runtime-log-done",
+                        node_key=active_node_id,
                     )
 
 
@@ -1191,25 +1355,24 @@ def handler(job):
 
                     current_node = data.get("node")
                     if current_node is None:
-                        _maybe_finalize_enhance_cycle(
-                            job,
-                            progress_state,
-                            runtime_log_state,
-                            reason="execution-finished",
-                        )
-                        _emit_enhance_completion_if_needed(
+                        active_node_id = runtime_log_state.get("active_node_id")
+                        if active_node_id:
+                            _maybe_finalize_enhance_cycle(
+                                job,
+                                progress_state,
+                                runtime_log_state,
+                                reason="execution-finished",
+                                node_key=active_node_id,
+                            )
+                        _emit_enhance_completion_for_all(
                             job,
                             progress_state,
                             runtime_log_state,
                             reason="execution-finished",
                         )
                         runtime_log_state["active_node_id"] = None
-                        runtime_log_state["enhance_counted_current"] = False
-                        _emit_enhance_state(
-                            job,
-                            progress_state,
-                            runtime_log_state,
-                            force=True,
+                        _emit_all_enhance_states(
+                            job, progress_state, runtime_log_state, force=True
                         )
                         enhance_suffix = _maybe_enhance_state_suffix(runtime_log_state)
                         print(f"worker-comfyui - Execution finished for prompt {prompt_id}")
@@ -1245,18 +1408,15 @@ def handler(job):
                             progress_state,
                             runtime_log_state,
                             reason="node-transition",
+                            node_key=previous_active_node,
                         )
                         _emit_enhance_completion_if_needed(
                             job,
                             progress_state,
                             runtime_log_state,
                             reason="node-transition",
+                            node_key=previous_active_node,
                         )
-                        runtime_log_state["enhance_counted_current"] = False
-                        runtime_log_state["enhance_cycle_complete"] = False
-                        runtime_log_state["enhance_peak_step"] = 0
-                        runtime_log_state["enhance_last_step"] = None
-                        runtime_log_state["enhance_last_total_steps"] = None
 
                     if _is_sampler_node(node_type, node_title) and _select_enhancement_node(
                         job,
@@ -1267,15 +1427,21 @@ def handler(job):
                         node_type,
                         source="executing",
                     ):
-                        if not runtime_log_state.get("enhance_phase_initialized", False):
-                            runtime_log_state["enhance_samples_done"] = 0
-                            runtime_log_state["enhance_executed_seen"] = False
-                            runtime_log_state["last_enhance_total_emitted"] = None
-                            runtime_log_state["enhance_phase_initialized"] = True
-                            runtime_log_state["enhance_peak_step"] = 0
-                            runtime_log_state["enhance_last_step"] = None
-                            runtime_log_state["enhance_last_total_steps"] = None
-                        runtime_log_state["enhance_counted_current"] = False
+                        node_state = _ensure_enhance_node_state(
+                            runtime_log_state, node_key
+                        )
+                        if not node_state.get("phase_initialized", False):
+                            node_state["samples_done"] = 0
+                            node_state["executed_seen"] = False
+                            node_state["phase_initialized"] = True
+                            node_state["peak_step"] = 0
+                            node_state["last_step"] = None
+                            node_state["last_total_steps"] = None
+                            node_state["counted_current"] = False
+                            node_state["cycle_complete"] = False
+                        else:
+                            node_state["counted_current"] = False
+                        _sync_active_enhance_compat(runtime_log_state, node_key)
 
                     if node_key != progress_state.get("last_node_id"):
                         progress_state["last_node_id"] = node_key
@@ -1333,8 +1499,22 @@ def handler(job):
                         ):
                             continue
 
-                        prev_step = runtime_log_state.get("enhance_last_step")
-                        prev_total = runtime_log_state.get("enhance_last_total_steps")
+                        node_state = _ensure_enhance_node_state(
+                            runtime_log_state, node_key
+                        )
+                        if not node_state.get("phase_initialized", False):
+                            node_state["phase_initialized"] = True
+                            node_state["samples_done"] = int(
+                                node_state.get("samples_done") or 0
+                            )
+                            node_state["counted_current"] = False
+                            node_state["cycle_complete"] = False
+                            node_state["peak_step"] = 0
+                            node_state["last_step"] = None
+                            node_state["last_total_steps"] = None
+
+                        prev_step = node_state.get("last_step")
+                        prev_total = node_state.get("last_total_steps")
                         if (
                             isinstance(prev_step, int)
                             and isinstance(prev_total, int)
@@ -1342,7 +1522,7 @@ def handler(job):
                             and value_int < prev_step
                         ):
                             if (
-                                not runtime_log_state.get("enhance_counted_current", False)
+                                not node_state.get("counted_current", False)
                                 and prev_step > 0
                             ):
                                 _emit_enhance_item(
@@ -1350,29 +1530,30 @@ def handler(job):
                                     progress_state,
                                     runtime_log_state,
                                     reason="step-reset",
+                                    node_key=node_key,
                                 )
-                            runtime_log_state["enhance_counted_current"] = False
-                            runtime_log_state["enhance_cycle_complete"] = False
-                            runtime_log_state["enhance_peak_step"] = 0
+                            node_state["counted_current"] = False
+                            node_state["cycle_complete"] = False
+                            node_state["peak_step"] = 0
 
                         if (
-                            runtime_log_state.get("enhance_counted_current", False)
+                            node_state.get("counted_current", False)
                             and value_int <= 1
                         ):
-                            runtime_log_state["enhance_counted_current"] = False
-                            runtime_log_state["enhance_cycle_complete"] = False
-                            runtime_log_state["enhance_peak_step"] = 0
+                            node_state["counted_current"] = False
+                            node_state["cycle_complete"] = False
+                            node_state["peak_step"] = 0
 
-                        runtime_log_state["enhance_peak_step"] = max(
-                            int(runtime_log_state.get("enhance_peak_step") or 0),
+                        node_state["peak_step"] = max(
+                            int(node_state.get("peak_step") or 0),
                             value_int,
                         )
-                        runtime_log_state["enhance_last_step"] = value_int
-                        runtime_log_state["enhance_last_total_steps"] = maximum_int
+                        node_state["last_step"] = value_int
+                        node_state["last_total_steps"] = maximum_int
 
-                        total_hint = _enhance_total_hint(runtime_log_state)
-                        done_items = int(runtime_log_state.get("enhance_samples_done") or 0)
-                        if runtime_log_state.get("enhance_counted_current", False):
+                        total_hint = _enhance_total_hint(runtime_log_state, node_key=node_key)
+                        done_items = int(node_state.get("samples_done") or 0)
+                        if node_state.get("counted_current", False):
                             current_item = done_items
                         else:
                             current_item = done_items + 1
@@ -1400,20 +1581,23 @@ def handler(job):
                         if (
                             maximum_int > 0
                             and value_int >= maximum_int
-                            and not runtime_log_state.get("enhance_counted_current", False)
+                            and not node_state.get("counted_current", False)
                         ):
                             _emit_enhance_item(
                                 job,
                                 progress_state,
                                 runtime_log_state,
                                 reason="progress-max",
+                                node_key=node_key,
                             )
 
+                        _sync_active_enhance_compat(runtime_log_state, node_key)
                         _emit_enhance_state(
                             job,
                             progress_state,
                             runtime_log_state,
                             force=True,
+                            node_key=node_key,
                         )
 
                 elif msg_type == "execution_start":
@@ -1442,17 +1626,23 @@ def handler(job):
                             node_type,
                             source="executed",
                         ):
-                            runtime_log_state["enhance_executed_seen"] = True
-                            if not runtime_log_state.get("enhance_counted_current", False):
+                            node_state = _ensure_enhance_node_state(
+                                runtime_log_state, node_key
+                            )
+                            node_state["phase_initialized"] = True
+                            node_state["executed_seen"] = True
+                            if not node_state.get("counted_current", False):
                                 _emit_enhance_item(
                                     job,
                                     progress_state,
                                     runtime_log_state,
                                     reason="executed",
+                                    node_key=node_key,
                                 )
-                            runtime_log_state["enhance_peak_step"] = 0
-                            runtime_log_state["enhance_last_step"] = None
-                            runtime_log_state["enhance_last_total_steps"] = None
+                            node_state["peak_step"] = 0
+                            node_state["last_step"] = None
+                            node_state["last_total_steps"] = None
+                            _sync_active_enhance_compat(runtime_log_state, node_key)
                         _emit_live_log(
                             job,
                             progress_state,
@@ -1488,6 +1678,11 @@ def handler(job):
                     _safe_progress_update(
                         job, interrupted_msg, progress_state, force=True
                     )
+                    if FAIL_FAST_ON_EXECUTION_ERROR:
+                        return _failure_result(
+                            "Workflow execution interrupted",
+                            details=[interrupted_msg],
+                        )
                     break
 
                 elif msg_type == "execution_error":
@@ -1515,6 +1710,11 @@ def handler(job):
                         progress_state,
                         force=True,
                     )
+                    if FAIL_FAST_ON_EXECUTION_ERROR:
+                        return _failure_result(
+                            "Workflow execution error",
+                            details=[f"Workflow execution error: {error_details}"],
+                        )
                     break
 
             except websocket.WebSocketTimeoutException:
@@ -1577,13 +1777,13 @@ def handler(job):
                 "Workflow monitoring loop exited without confirmation of completion or error."
             )
 
-        _emit_enhance_completion_if_needed(
+        _emit_enhance_completion_for_all(
             job,
             progress_state,
             runtime_log_state,
             reason="post-loop",
         )
-        _emit_enhance_state(job, progress_state, runtime_log_state, force=True)
+        _emit_all_enhance_states(job, progress_state, runtime_log_state, force=True)
         enhance_suffix = _maybe_enhance_state_suffix(runtime_log_state)
 
         # Fetch history even if there were execution errors, some outputs might exist
@@ -1594,7 +1794,7 @@ def handler(job):
             progress_state,
             force=True,
         )
-        _emit_enhance_state(job, progress_state, runtime_log_state, force=True)
+        _emit_all_enhance_states(job, progress_state, runtime_log_state, force=True)
         history = get_history(prompt_id)
 
         if prompt_id not in history:
@@ -1625,7 +1825,7 @@ def handler(job):
             progress_state,
             force=True,
         )
-        _emit_enhance_state(job, progress_state, runtime_log_state, force=True)
+        _emit_all_enhance_states(job, progress_state, runtime_log_state, force=True)
         for node_id, node_output in outputs.items():
             if "images" in node_output:
                 print(
@@ -1638,7 +1838,7 @@ def handler(job):
                     progress_state,
                     force=True,
                 )
-                _emit_enhance_state(job, progress_state, runtime_log_state, force=True)
+                _emit_all_enhance_states(job, progress_state, runtime_log_state, force=True)
                 for image_info in node_output["images"]:
                     filename = image_info.get("filename")
                     subfolder = image_info.get("subfolder", "")
